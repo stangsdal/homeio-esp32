@@ -1,120 +1,199 @@
 
 #include <Arduino.h>
 #include <HardwareSerial.h>
+#include <FS.h>
+#include <LittleFS.h>
+#include <SPIFFS.h>
 #include <modbus/wavin/WavinAhc9000Gateway.h>
-#include <WiFi.h>
-#include <WiFiClient.h>
+#include <Homie.h>
 
-#include <PubSubClient.h>
-#include "ota_helper.h"
-
-#define SETUP_AP_SSID "HOMEIO-SETUP-AHC01"
 #define SETUP_AP_PASS "homeio123"
 
-// --- Device identity (from dev guide) ---
-const char *HOME_ID = "stangsdal";
-const char *DEVICE_ID = "ahc01";
-const char *DEVICE_TYPE = "wavin_ahc9000";
 const char *FW_VERSION = "1.0.0";
 
-// --- WiFi/MQTT config (simulate NVS storage) ---
-struct AppConfig {
-  String wifi_ssid;
-  String wifi_password;
-  String mqtt_host;
-  uint16_t mqtt_port = 1883;
-  String mqtt_user;
-  String mqtt_password;
-  String home_id;
-  String device_id;
-} appConfig;
-
-WiFiClient espClient;
-PubSubClient mqttClient(espClient);
-
+#ifndef HOMIE_USE_LITTLEFS
+#define HOMIE_USE_LITTLEFS 0
+#endif
 
 // --- Serial and gateway ---
 HardwareSerial wavinSerial(1);
 WavinAhc9000Gateway gateway;
+HomieNode gatewayNode("gateway", "Gateway", "bridge");
+unsigned long lastStateSentMs = 0;
+
+namespace {
+const char* kHomieDirPath = "/homie";
+const char* kHomieUiBundlePath = "/homie/ui_bundle.gz";
+
+void logBootInfo() {
+#if HOMIE_USE_LITTLEFS
+  const char* fsName = "LittleFS";
+#else
+  const char* fsName = "SPIFFS";
+#endif
+  Serial.printf("[BOOT] homeio fw=%s fs=%s\n", FW_VERSION, fsName);
+}
+
+bool ensureHomieDir(fs::FS& filesystem) {
+#if HOMIE_USE_LITTLEFS
+  if (filesystem.exists(kHomieDirPath)) {
+    return true;
+  }
+  return filesystem.mkdir(kHomieDirPath);
+#else
+  (void)filesystem;
+  return true;
+#endif
+}
+
+bool copyFile(fs::FS& srcFs, fs::FS& dstFs, const char* path) {
+  File source = srcFs.open(path, "r");
+  if (!source) {
+    return false;
+  }
+
+  File dest = dstFs.open(path, "w");
+  if (!dest) {
+    source.close();
+    return false;
+  }
+
+  uint8_t buf[1024];
+  while (source.available()) {
+    size_t readLen = source.read(buf, sizeof(buf));
+    if (readLen == 0) {
+      break;
+    }
+    if (dest.write(buf, readLen) != readLen) {
+      source.close();
+      dest.close();
+      return false;
+    }
+  }
+
+  source.close();
+  dest.close();
+  return true;
+}
+
+void preflightHomieUiBundle() {
+#if HOMIE_USE_LITTLEFS
+  const bool activeMounted = LittleFS.begin(false);
+  if (!activeMounted) {
+    Serial.println("[FS] LittleFS mount failed during preflight");
+    return;
+  }
+
+  if (LittleFS.exists(kHomieUiBundlePath)) {
+    Serial.println("[FS] Homie UI bundle found in LittleFS");
+    return;
+  }
+
+  Serial.println("[FS] Homie UI bundle missing in LittleFS, probing SPIFFS");
+  const bool fallbackMounted = SPIFFS.begin(false);
+  if (!fallbackMounted) {
+    Serial.println("[FS] SPIFFS mount failed, cannot recover UI bundle");
+    return;
+  }
+
+  const bool fallbackHasBundle = SPIFFS.exists(kHomieUiBundlePath);
+  if (!fallbackHasBundle) {
+    Serial.println("[FS] Homie UI bundle not found in SPIFFS either");
+    SPIFFS.end();
+    return;
+  }
+
+  if (!ensureHomieDir(LittleFS)) {
+    Serial.println("[FS] Could not create /homie in LittleFS");
+    SPIFFS.end();
+    return;
+  }
+
+  if (copyFile(SPIFFS, LittleFS, kHomieUiBundlePath)) {
+    Serial.println("[FS] Recovered Homie UI bundle from SPIFFS to LittleFS");
+  } else {
+    Serial.println("[FS] Failed to copy Homie UI bundle from SPIFFS to LittleFS");
+  }
+  SPIFFS.end();
+#else
+  const bool activeMounted = SPIFFS.begin(false);
+  if (!activeMounted) {
+    Serial.println("[FS] SPIFFS mount failed during preflight");
+    return;
+  }
+
+  if (SPIFFS.exists(kHomieUiBundlePath)) {
+    Serial.println("[FS] Homie UI bundle found in SPIFFS");
+    return;
+  }
+
+  Serial.println("[FS] Homie UI bundle missing in SPIFFS, probing LittleFS");
+  const bool fallbackMounted = LittleFS.begin(false);
+  if (!fallbackMounted) {
+    Serial.println("[FS] LittleFS mount failed, cannot recover UI bundle");
+    return;
+  }
+
+  const bool fallbackHasBundle = LittleFS.exists(kHomieUiBundlePath);
+  if (!fallbackHasBundle) {
+    Serial.println("[FS] Homie UI bundle not found in LittleFS either");
+    return;
+  }
+
+  if (copyFile(LittleFS, SPIFFS, kHomieUiBundlePath)) {
+    Serial.println("[FS] Recovered Homie UI bundle from LittleFS to SPIFFS");
+  } else {
+    Serial.println("[FS] Failed to copy Homie UI bundle from LittleFS to SPIFFS");
+  }
+#endif
+}
+} // namespace
 
 
 void logLine(const String &msg) {
   Serial.println(msg);
 }
 
-void startCaptivePortal() {
-  Serial.println("[WIFI] Starting AP mode for provisioning...");
-  WiFi.softAP(SETUP_AP_SSID, SETUP_AP_PASS);
-  // TODO: Start web server for captive portal (user input)
-  // For demo: simulate config entry after delay
-  delay(3000);
-  appConfig.wifi_ssid = "MyWiFi";
-  appConfig.wifi_password = "xxxxx";
-  appConfig.mqtt_host = "192.168.30.10";
-  appConfig.mqtt_port = 1883;
-  appConfig.mqtt_user = "home_7f3a91";
-  appConfig.mqtt_password = "secret";
-  appConfig.home_id = HOME_ID;
-  appConfig.device_id = DEVICE_ID;
-  Serial.println("[WIFI] Simulated config entered. Rebooting...");
-  ESP.restart();
+void publishGatewayState() {
+  const auto &mainState = gateway.mainState();
+  gatewayNode.setProperty("status").send(String(mainState.status));
+  gatewayNode.setProperty("dhw-temp").send(String(mainState.dhwSensorTemperature / 10.0f, 1));
+  gatewayNode.setProperty("inlet-temp").send(String(mainState.inletSensorTemperature / 10.0f, 1));
+  gatewayNode.setProperty("current").send(String(mainState.totalCurrentRaw));
 }
 
-void connectToWiFi() {
-  Serial.printf("[WIFI] Connecting to %s...\n", appConfig.wifi_ssid.c_str());
-  WiFi.mode(WIFI_STA);
-  WiFi.begin(appConfig.wifi_ssid.c_str(), appConfig.wifi_password.c_str());
-  unsigned long start = millis();
-  while (WiFi.status() != WL_CONNECTED && millis() - start < 15000) {
-    delay(500);
-    Serial.print(".");
-  }
-  Serial.println();
-  if (WiFi.status() == WL_CONNECTED) {
-    Serial.println("[WIFI] Connected!");
-  } else {
-    Serial.println("[WIFI] Failed to connect. Starting AP mode.");
-    startCaptivePortal();
+void homieLoopHandler() {
+  if (millis() - lastStateSentMs >= 10000UL || lastStateSentMs == 0) {
+    publishGatewayState();
+    lastStateSentMs = millis();
   }
 }
 
-void mqttCallback(char* topic, byte* payload, unsigned int length) {
-  // Handle incoming MQTT messages (commands)
-}
-
-void connectToMQTT() {
-  mqttClient.setServer(appConfig.mqtt_host.c_str(), appConfig.mqtt_port);
-  mqttClient.setCallback(mqttCallback);
-  while (!mqttClient.connected()) {
-    Serial.print("[MQTT] Connecting...");
-    if (mqttClient.connect(appConfig.device_id.c_str(), appConfig.mqtt_user.c_str(), appConfig.mqtt_password.c_str())) {
-      Serial.println("connected!");
-      // Subscribe to command topic
-      String cmdTopic = String("homeio/") + appConfig.home_id + "/" + appConfig.device_id + "/cmd";
-      mqttClient.subscribe(cmdTopic.c_str());
-    } else {
-      Serial.print("failed, rc=");
-      Serial.print(mqttClient.state());
-      Serial.println(" retrying in 2s");
-      delay(2000);
-    }
+void onHomieEvent(const HomieEvent& event) {
+  switch (event.type) {
+    case HomieEventType::CONFIGURATION_MODE:
+      Serial.println("[HOMIE] Configuration mode active");
+      break;
+    case HomieEventType::NORMAL_MODE:
+      Serial.println("[HOMIE] Normal mode active");
+      break;
+    case HomieEventType::MQTT_READY:
+      Serial.println("[HOMIE] MQTT ready");
+      publishGatewayState();
+      lastStateSentMs = millis();
+      break;
+    case HomieEventType::MQTT_DISCONNECTED:
+      Serial.println("[HOMIE] MQTT disconnected");
+      break;
+    default:
+      break;
   }
-}
-
-void publishRegistration() {
-  String regTopic = String("homeio/") + appConfig.home_id + "/" + appConfig.device_id + "/register";
-  String payload = String("{") +
-    "\"device_id\":\"" + appConfig.device_id + "\"," +
-    "\"type\":\"" + DEVICE_TYPE + "\"," +
-    "\"fw\":\"" + FW_VERSION + "\"," +
-    "\"capabilities\":[\"climate\",\"heating\"]}";
-  mqttClient.publish(regTopic.c_str(), payload.c_str(), true);
-  Serial.println("[MQTT] Registration published:");
-  Serial.println(payload);
 }
 
 void setup() {
   Serial.begin(115200);
+  logBootInfo();
+  preflightHomieUiBundle();
 
   // --- Configure Wavin gateway ---
   WavinAhc9000Gateway::Config cfg;
@@ -129,48 +208,21 @@ void setup() {
 
   gateway.begin(wavinSerial, cfg, logLine);
 
-  // --- Provisioning logic ---
-  if (appConfig.wifi_ssid.isEmpty()) {
-    startCaptivePortal();
-    return;
-  }
+  Homie_setBrand("homeio");
+  Homie_setFirmware("wavin-ahc9000", "1.0.0");
+  Homie.setConfigurationApPassword(SETUP_AP_PASS);
+  Homie.onEvent(onHomieEvent);
+  Homie.setLoopFunction(homieLoopHandler);
 
-  connectToWiFi();
-  setupOTA(appConfig.device_id.c_str());
-  connectToMQTT();
-  publishRegistration();
-}
+  gatewayNode.advertise("status").setName("Status").setDatatype("integer");
+  gatewayNode.advertise("dhw-temp").setName("DHW Temperature").setDatatype("float").setUnit("C");
+  gatewayNode.advertise("inlet-temp").setName("Inlet Temperature").setDatatype("float").setUnit("C");
+  gatewayNode.advertise("current").setName("Current").setDatatype("integer").setUnit("A");
 
-void publishState() {
-  // Eksempel: udvidet state med Wavin data
-  String stateTopic = String("homeio/") + appConfig.home_id + "/" + appConfig.device_id + "/state";
-  const auto &mainState = gateway.mainState();
-  String payload = "{";
-  payload += "\"fw\":\"" + String(FW_VERSION) + "\",";
-  payload += "\"status\":" + String(mainState.status) + ",";
-  payload += "\"dhw_temp\":" + String(mainState.dhwSensorTemperature / 10.0f) + ",";
-  payload += "\"inlet_temp\":" + String(mainState.inletSensorTemperature / 10.0f) + ",";
-  payload += "\"current\":" + String(mainState.totalCurrentRaw) + "}";
-  mqttClient.publish(stateTopic.c_str(), payload.c_str(), true);
-  // Backend integration: evt. HTTP POST kan tilføjes her
+  Homie.setup();
 }
 
 void loop() {
   gateway.service();
-  handleOTA();
-  if (WiFi.status() != WL_CONNECTED) {
-    connectToWiFi();
-  }
-  if (!mqttClient.connected()) {
-    connectToMQTT();
-    publishRegistration();
-  }
-  mqttClient.loop();
-  // Periodically publish state
-  static unsigned long lastState = 0;
-  if (millis() - lastState > 10000) {
-    publishState();
-    lastState = millis();
-  }
-  delay(100);
+  Homie.loop();
 }

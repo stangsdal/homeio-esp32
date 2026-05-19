@@ -1,0 +1,69 @@
+{
+  "name": "homie-v5",
+  "version": "3.6.1",
+  "keywords": "iot, home, automation, mqtt, esp8266, esp32, async, sensor, homie-v4, homie-v5, ota, platformio",
+  "description": "Maintained Homie MQTT framework fork for ESP8266 / ESP32, focused on Homie v5 support while keeping Homie v3/v4 compatibility",
+  "homepage": "https://github.com/labodj/homie-esp8266",
+  "license": "MIT",
+  "authors": [
+    {
+      "name": "Marvin Roger",
+      "url": "https://www.marvinroger.fr"
+    },
+    {
+      "name": "Ian Hubbertz",
+      "url": "https://github.com/euphi"
+    },
+    {
+      "name": "Jacopo Labardi",
+      "url": "https://github.com/labodj",
+      "maintainer": true
+    }
+  ],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/labodj/homie-esp8266.git"
+  },
+  "frameworks": "arduino",
+  "platforms": ["espressif8266", "espressif32"],
+  "dependencies": [
+    {
+      "owner": "bblanchon",
+      "name": "ArduinoJson",
+      "version": "^6.21.6",
+      "platforms": ["espressif8266", "espressif32"]
+    },
+    {
+      "name": "AsyncMqttClient",
+      "version": "https://github.com/labodj/async-mqtt-client.git#7d61a5ddcdf69379193f972836dc2e89d5e8b93f",
+      "platforms": ["espressif8266", "espressif32"]
+    },
+    {
+      "owner": "esp32async",
+      "name": "ESPAsyncWebServer",
+      "platforms": ["espressif8266", "espressif32"]
+    },
+    {
+      "owner": "thomasfredericks",
+      "name": "Bounce2",
+      "platforms": ["espressif8266", "espressif32"]
+    }
+  ],
+  "build": {
+    "libCompatMode": "strict"
+  },
+  "export": {
+    "include": [
+      "LICENSE",
+      "README.md",
+      "docs",
+      "keywords.txt",
+      "library.json",
+      "library.properties",
+      "src",
+      "examples",
+      "scripts/homie_ota.py",
+      "scripts/ota_updater"
+    ]
+  }
+}
